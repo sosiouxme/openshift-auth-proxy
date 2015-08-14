@@ -31,6 +31,10 @@ var argv = require('yargs')
       describe: 'Proxy auth mode',
       choices:  ['oauth2', 'bearer', 'mutual_tls', 'dummy'],
       default: process.env.OAP_AUTH_MODE || 'oauth2'
+    }, 'plugin': {
+      describe: 'Plugin for transforming the request/response after authentication',
+      choices:  ['user_header', 'kibana_es', 'es', 'none'],
+      default: process.env.OAP_PLUGIN || 'user_header'
     }, 'user-header': {
       describe: 'Header for sending user name on the proxied request',
       default: process.env.OAP_REMOTE_USER_HEADER || 'X-Proxy-Remote-User'
