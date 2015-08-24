@@ -7,6 +7,7 @@ var express        = require('express'),
     BearerStrategy = require('passport-http-bearer'),
     httpProxy      = require('http-proxy'),
     https          = require('https'),
+    url            = require('url'),
     urljoin        = require('url-join'),
     request        = require('request'),
     morgan         = require('morgan'),
@@ -163,7 +164,7 @@ if(argv['debug']) {
 }
 
 //
-// ensure we validate connecions to master w/ master CA
+// ensure we validate connections to master w/ master CA
 //
 var cas = https.globalAgent.options.ca || [];
 cas.push(masterCA);
@@ -267,10 +268,10 @@ var ensureAuthenticated = function(req, res, next) {
 // Create the handler for proxy server requests
 //
 var app = express();
-app.use(morgan('combined'))
+app.use(morgan('combined')) // standard "combined" proxy log output
 
 //
-// Implement the configured authentication method
+// Implement the configured authentication method handler
 //
 switch(argv['auth-mode']) {
   case 'oauth2':
@@ -310,20 +311,45 @@ switch(argv['auth-mode']) {
     break;
 };
 
+//
+// Implement the configured request plugin(s)
+//
+plugins = typeof(argv.plugin) === "string" ? [ argv.plugin ] : argv.plugin;
+function pluginHandler(proxyReq, req, res, options) {
+  plugins.forEach(function (name){
+    switch (name) {
+      case 'user_header':
+        if (argv.debug) console.log("setting %s header to '%s'",argv['user-header'], req.user.metadata.name);
+        proxyReq.setHeader(argv['user-header'], req.user.metadata.name);
+	break;
+      case 'kibana_es':
+        var reqUrl = url.parse(req.url);
+	if (reqUrl.pathname.indexOf('/.kibana') == 0) {
+	  // need to rewrite to user-specific kibana index
+	  reqUrl.pathname = reqUrl.pathname.replace(/^\/\.kibana/, "/.kibana-" + req.user.metadata.name)
+          if (argv.debug) console.log("rewriting path to '%s'", url.format(reqUrl));
+          proxyReq.path = url.format(reqUrl);
+	}
+	break;
+      case 'es':
+	break;
+    }
+  });
+}
 
 //
-// Set up the proxy server to delegate to our handler
+// Set up the proxy server to delegate to our handlers
 //
 var proxy = new httpProxy.createProxyServer({
   target: argv.backend,
-  changeOrigin: argv['use-backend-host-header']
+  changeOrigin: argv['use-backend-host-header'],
+  xfwd: true,
+  ws: true
 });
 proxy.on('error', function(e) {
   console.error("proxy error: %s", JSON.stringify(e));
 });
-proxy.on('proxyReq', function(proxyReq, req, res, options) {
-  proxyReq.setHeader(argv['user-header'], req.user.metadata.name);
-});
+proxy.on('proxyReq', pluginHandler);
 
 app.all('*', ensureAuthenticated, function(req, res) {
   proxy.web(req, res);
