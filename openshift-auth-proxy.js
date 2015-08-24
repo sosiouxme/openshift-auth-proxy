@@ -162,11 +162,26 @@ if(argv['debug']) {
   })
 }
 
+//
+// ensure we validate connecions to master w/ master CA
+//
 var cas = https.globalAgent.options.ca || [];
 cas.push(masterCA);
 https.globalAgent.options.ca = cas;
 
+// where to get OpenShift user information for current auth
 var openshiftUserUrl = urljoin(argv['master-url'], '/oapi/v1/users/~');
+
+//
+// ---------------------- passport auth --------------------------
+//
+
+//
+// set up for passport authentication if it will be needed
+//
+function noSerialization(user, done) {
+  done(null, user);
+}
 
 var validateBearerToken = function(accessToken, refreshToken, profile, done) {
   if (argv.debug) console.log("in validateBearerToken: ", accessToken, refreshToken, profile);
@@ -182,9 +197,11 @@ var validateBearerToken = function(accessToken, refreshToken, profile, done) {
   };
   var authReq = request.get(authOptions);
   authReq.on('response', function(authRes) {
+    if(argv.debug) console.log("in authReq");
     if (authRes.statusCode != 200) {
       done();
     } else {
+      // collect response data, could be chunked
       var data = '';
       authRes.on('data', function (chunk){
         data += chunk;
@@ -197,50 +214,16 @@ var validateBearerToken = function(accessToken, refreshToken, profile, done) {
   });
 };
 
-switch(argv['auth-mode']) {
-  case 'oauth2':
-    passport.use(new OAuth2Strategy({
-        authorizationURL: urljoin(argv['public-master-url'], '/oauth/authorize'),
-        tokenURL: urljoin(argv['master-url'], '/oauth/token'),
-        clientID: argv['client-id'],
-        clientSecret: clientSecret,
-        callbackURL: argv['callback-url']
-      },
-      validateBearerToken
-    ));
-  case 'bearer':
-    passport.use(new BearerStrategy(
-      function(token, done) {
-        validateBearerToken(token, null, null, done);
-      }
-    ));
-};
-
-
-passport.serializeUser(function(user, done) {
-  done(null, user);
-});
-
-passport.deserializeUser(function(user, done) {
-  done(null, user);
-});
-
-var proxy = new httpProxy.createProxyServer({
-  target: argv.backend,
-  changeOrigin: argv['use-backend-host-header']
-});
-
-proxy.on('error', function(e) {
-  console.error("proxy error: %s", JSON.stringify(e));
-});
-
-var app = express();
-
-app.use(morgan('combined'))
-
-var useSession = argv['auth-mode'] === 'oauth2';
-
-if (useSession) {
+var setupOauth = function(app) {
+  passport.use(new OAuth2Strategy({
+      authorizationURL: urljoin(argv['public-master-url'], '/oauth/authorize'),
+      tokenURL: urljoin(argv['master-url'], '/oauth/token'),
+      clientID: argv['client-id'],
+      clientSecret: clientSecret,
+      callbackURL: argv['callback-url']
+    },
+    validateBearerToken
+  ));
   app.use(sessions({
     cookieName: 'openshift-auth-proxy-session',
     requestKey: 'session',
@@ -251,33 +234,93 @@ if (useSession) {
       ephemeral: argv['session-ephemeral']
     }
   }));
-
   app.use(passport.initialize());
-
   app.use(passport.session());
-
   app.get(argv['callback-url'], function(req, res) {
+    if(argv['debug']) {
+      console.log("in validateBearerToken for req path " + req.path);
+    }
     var returnTo = req.session.returnTo;
     passport.authenticate(argv['auth-mode'])(req, res, function() {
       res.redirect(returnTo || '/');
     });
   });
-} else {
-  app.use(passport.initialize());
 }
 
-function ensureAuthenticated(req, res, next) {
+var useSession = false;
+var ensureAuthenticated = function(req, res, next) {
+  if (argv.debug) console.log("in passport.ensureAuthenticated for req path " + req.path);
   if (req.isAuthenticated()) {
-    if (argv.debug) { console.log("authenticated, moving on.")}
     return next();
   }
-  if (argv.debug) { console.log("not authenticated.")}
   if (useSession) {
     req.session.returnTo = req.path;
   }
   passport.authenticate(argv['auth-mode'], {session: useSession})(req, res, next);
 }
 
+//
+// ---------------------- proxy and handler --------------------------
+//
+
+//
+// Create the handler for proxy server requests
+//
+var app = express();
+app.use(morgan('combined'))
+
+//
+// Implement the configured authentication method
+//
+switch(argv['auth-mode']) {
+  case 'oauth2':
+    useSession = true;
+    setupOauth(app);
+    // NO break, should implement bearer too
+  case 'bearer':
+    passport.use(new BearerStrategy(
+      function(token, done) {
+        validateBearerToken(token, null, null, done);
+      }
+    ));
+    app.use(passport.initialize());
+    passport.serializeUser(noSerialization);
+    passport.deserializeUser(noSerialization);
+    break;
+  case 'mutual_tls':
+    if (mutualTlsCa == null) {
+      throw "must supply 'mutual-tls-ca' to validate client connection";
+    }
+    proxyTLS['ca'] = mutualTlsCa;
+    proxyTLS['requestCert'] = true;
+    proxyTLS['rejectUnauthorized'] = true;
+    ensureAuthenticated = function(req, res, next) {
+      if (argv.debug) console.log("in mutual_tls.ensureAuthenticated for req path " + req.path);
+      if (argv.debug) console.log("client cert is: ", req.connection.getPeerCertificate());
+      req.user = { metadata: { name: req.connection.getPeerCertificate().subject['CN'] }};
+      return next();
+    };
+    break;
+  case 'dummy':
+    ensureAuthenticated = function(req, res, next) {
+      if (argv.debug) console.log("in dummy.ensureAuthenticated for req path " + req.path);
+      req.user = { metadata: { name: 'dummy'}};
+      return next();
+    };
+    break;
+};
+
+
+//
+// Set up the proxy server to delegate to our handler
+//
+var proxy = new httpProxy.createProxyServer({
+  target: argv.backend,
+  changeOrigin: argv['use-backend-host-header']
+});
+proxy.on('error', function(e) {
+  console.error("proxy error: %s", JSON.stringify(e));
+});
 proxy.on('proxyReq', function(proxyReq, req, res, options) {
   proxyReq.setHeader(argv['user-header'], req.user.metadata.name);
 });
@@ -286,5 +329,6 @@ app.all('*', ensureAuthenticated, function(req, res) {
   proxy.web(req, res);
 });
 
+console.log("Starting up the proxy with auth mode '%s' and proxy plugin '%s'.", argv['auth-mode'], argv['plugin'] )
 https.createServer(proxyTLS, app).listen(argv['listen-port']);
 
