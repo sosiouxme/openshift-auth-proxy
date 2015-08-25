@@ -32,8 +32,8 @@ var argv = require('yargs')
       describe: 'Proxy auth mode',
       choices:  ['oauth2', 'bearer', 'mutual_tls', 'dummy'],
       default: process.env.OAP_AUTH_MODE || 'oauth2'
-    }, 'plugin': {
-      describe: 'Plugin for transforming the request/response after authentication',
+    }, 'transform': {
+      describe: 'Transform name(s) to apply to the request/response after authentication',
       choices:  ['user_header', 'kibana_es', 'es', 'none'],
       default: process.env.OAP_PLUGIN || 'user_header'
     }, 'user-header': {
@@ -312,11 +312,11 @@ switch(argv['auth-mode']) {
 };
 
 //
-// Implement the configured request plugin(s)
+// Implement the configured request transform(s)
 //
-plugins = typeof(argv.plugin) === "string" ? [ argv.plugin ] : argv.plugin;
-function pluginHandler(proxyReq, req, res, options) {
-  plugins.forEach(function (name){
+transforms = typeof(argv.transform) === "string" ? [ argv.transform ] : argv.transform;
+function transformHandler(proxyReq, req, res, options) {
+  transforms.forEach(function (name){
     switch (name) {
       case 'user_header':
         if (argv.debug) console.log("setting %s header to '%s'",argv['user-header'], req.user.metadata.name);
@@ -349,12 +349,12 @@ var proxy = new httpProxy.createProxyServer({
 proxy.on('error', function(e) {
   console.error("proxy error: %s", JSON.stringify(e));
 });
-proxy.on('proxyReq', pluginHandler);
+proxy.on('proxyReq', transformHandler);
 
 app.all('*', ensureAuthenticated, function(req, res) {
   proxy.web(req, res);
 });
 
-console.log("Starting up the proxy with auth mode '%s' and proxy plugin '%s'.", argv['auth-mode'], argv['plugin'] )
+console.log("Starting up the proxy with auth mode '%s' and proxy transform '%s'.", argv['auth-mode'], argv['transform'] )
 https.createServer(proxyTLS, app).listen(argv['listen-port']);
 
